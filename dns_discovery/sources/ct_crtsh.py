@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -18,6 +19,7 @@ HOSTNAME_RE = re.compile(
 
 
 def parent_domains(hostname: str) -> list[str]:
+    """Walk label parents for CT queries — no public-suffix DB required."""
     host = hostname.lower().strip().rstrip(".")
     labels = host.split(".")
     out: list[str] = []
@@ -32,7 +34,10 @@ def parent_domains(hostname: str) -> list[str]:
 
 def normalize_ct_name(name: str) -> str | None:
     name = name.strip().lower().rstrip(".")
-    if not name or " " in name or "@" in name:
+    if not name or " " in name:
+        return None
+    # Drop email-like / junk
+    if "@" in name:
         return None
     if not HOSTNAME_RE.match(name) and not (name.startswith("*.") and HOSTNAME_RE.match(name[2:])):
         return None
@@ -40,6 +45,13 @@ def normalize_ct_name(name: str) -> str | None:
 
 
 class CrtShSource:
+    """
+    Source: https://crt.sh/?q=<query>&output=json
+    Auth: none
+    Rate limit: polite (config.ct_rps); crt.sh is often slow / rate-limits.
+    Fallback: mark unavailable on repeated failure — never fabricate certs.
+    """
+
     ENDPOINT = "https://crt.sh/"
 
     def __init__(
@@ -59,6 +71,10 @@ class CrtShSource:
         self._fail_streak = 0
 
     async def discover_hostnames(self, hostname: str) -> dict[str, Any]:
+        """
+        Returns evidence-backed related hostnames from CT.
+        Hostnames are CANDIDATES — not IPs and not validated.
+        """
         if not self.available:
             return {
                 "source": "certificate_transparency",
@@ -75,6 +91,7 @@ class CrtShSource:
             if parent.count(".") >= 1:
                 queries.append(f"%.{parent}")
 
+        # de-dupe preserve order
         seen_q: set[str] = set()
         uniq_queries = []
         for q in queries:
@@ -99,26 +116,30 @@ class CrtShSource:
                         if n:
                             hostnames.add(n)
                             extracted += 1
-                query_meta.append({
-                    "query": q,
-                    "endpoint": f"{self.ENDPOINT}?q={q}&output=json",
-                    "rows": len(rows),
-                    "names_extracted": extracted,
-                    "timestamp": utc_now_iso(),
-                    "status": "ok",
-                })
+                query_meta.append(
+                    {
+                        "query": q,
+                        "endpoint": f"{self.ENDPOINT}?q={q}&output=json",
+                        "rows": len(rows),
+                        "names_extracted": extracted,
+                        "timestamp": utc_now_iso(),
+                        "status": "ok",
+                    }
+                )
                 self._fail_streak = 0
             except Exception as e:
                 self._fail_streak += 1
                 self.failures.record("certificate_transparency", f"crt.sh:{q}", e, hostname=hostname)
-                query_meta.append({
-                    "query": q,
-                    "endpoint": f"{self.ENDPOINT}?q={q}&output=json",
-                    "rows": 0,
-                    "status": "error",
-                    "error_type": type(e).__name__,
-                    "timestamp": utc_now_iso(),
-                })
+                query_meta.append(
+                    {
+                        "query": q,
+                        "endpoint": f"{self.ENDPOINT}?q={q}&output=json",
+                        "rows": 0,
+                        "status": "error",
+                        "error_type": type(e).__name__,
+                        "timestamp": utc_now_iso(),
+                    }
+                )
                 if self._fail_streak >= 3:
                     self.available = False
                     self.failures.record(
@@ -130,6 +151,7 @@ class CrtShSource:
                     )
                     break
 
+        # Prefer concrete hostnames; keep wildcards as separate candidates (stripped for resolve)
         concrete = sorted(h for h in hostnames if not h.startswith("*."))
         wildcards = sorted(h for h in hostnames if h.startswith("*."))
 

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS ip_records (
     related_hostnames_json TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (hostname, ip)
 );
+
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     hostname TEXT NOT NULL,
@@ -33,30 +34,57 @@ CREATE TABLE IF NOT EXISTS sources (
     detail_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(hostname, ip, type, resolver, tool, timestamp, detail_json)
 );
+
 CREATE TABLE IF NOT EXISTS enrichment (
     ip TEXT PRIMARY KEY,
-    asn TEXT, prefix TEXT, organization TEXT, isp TEXT, country TEXT,
-    reverse_dns TEXT, source TEXT, updated_at TEXT NOT NULL
+    asn TEXT,
+    prefix TEXT,
+    organization TEXT,
+    isp TEXT,
+    country TEXT,
+    reverse_dns TEXT,
+    source TEXT,
+    updated_at TEXT NOT NULL
 );
+
 CREATE TABLE IF NOT EXISTS classification (
     ip TEXT PRIMARY KEY,
-    provider TEXT, cdn TEXT, confidence TEXT,
-    evidence_json TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL
+    provider TEXT,
+    cdn TEXT,
+    confidence TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
 );
+
 CREATE TABLE IF NOT EXISTS validation (
-    hostname TEXT NOT NULL, ip TEXT NOT NULL, result_json TEXT NOT NULL,
-    timestamp TEXT NOT NULL, PRIMARY KEY (hostname, ip)
+    hostname TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    PRIMARY KEY (hostname, ip)
 );
+
 CREATE TABLE IF NOT EXISTS failures (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL, operation TEXT NOT NULL, hostname TEXT,
-    timestamp TEXT NOT NULL, error_type TEXT NOT NULL, message TEXT NOT NULL
+    source TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    hostname TEXT,
+    timestamp TEXT NOT NULL,
+    error_type TEXT NOT NULL,
+    message TEXT NOT NULL
 );
+
 CREATE TABLE IF NOT EXISTS observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    hostname TEXT NOT NULL, record_type TEXT NOT NULL, value TEXT NOT NULL,
-    resolver TEXT, timestamp TEXT NOT NULL, source TEXT NOT NULL,
-    cname_chain_json TEXT NOT NULL DEFAULT '[]', tool TEXT, ip TEXT
+    hostname TEXT NOT NULL,
+    record_type TEXT NOT NULL,
+    value TEXT NOT NULL,
+    resolver TEXT,
+    timestamp TEXT NOT NULL,
+    source TEXT NOT NULL,
+    cname_chain_json TEXT NOT NULL DEFAULT '[]',
+    tool TEXT,
+    ip TEXT
 );
 """
 
@@ -72,6 +100,7 @@ class EvidenceStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+        # In-memory index for fast dedup during a run
         self._records: dict[tuple[str, str], IpRecord] = {}
         self._load_existing()
 
@@ -80,7 +109,7 @@ class EvidenceStore:
             cur = self._conn.execute("SELECT * FROM ip_records")
             for row in cur.fetchall():
                 key = (row["hostname"], row["ip"])
-                self._records[key] = IpRecord(
+                rec = IpRecord(
                     hostname=row["hostname"],
                     ip=row["ip"],
                     first_seen=row["first_seen"],
@@ -89,17 +118,22 @@ class EvidenceStore:
                     dns=json.loads(row["dns_json"] or "{}"),
                     related_hostnames=json.loads(row["related_hostnames_json"] or "[]"),
                 )
+                self._records[key] = rec
+            # attach sources
             cur = self._conn.execute("SELECT * FROM sources")
             for row in cur.fetchall():
                 key = (row["hostname"], row["ip"])
-                if key in self._records:
-                    self._records[key].sources.append(SourceEvidence(
+                if key not in self._records:
+                    continue
+                self._records[key].sources.append(
+                    SourceEvidence(
                         type=row["type"],
                         timestamp=row["timestamp"],
                         resolver=row["resolver"],
                         tool=row["tool"],
                         detail=json.loads(row["detail_json"] or "{}"),
-                    ))
+                    )
+                )
             cur = self._conn.execute("SELECT * FROM enrichment")
             enrich_map = {r["ip"]: r for r in cur.fetchall()}
             cur = self._conn.execute("SELECT * FROM classification")
@@ -110,20 +144,29 @@ class EvidenceStore:
                 e = enrich_map.get(rec.ip)
                 if e:
                     rec.network = NetworkInfo(
-                        asn=e["asn"], prefix=e["prefix"], organization=e["organization"],
-                        isp=e["isp"], country=e["country"], reverse_dns=e["reverse_dns"], source=e["source"],
+                        asn=e["asn"],
+                        prefix=e["prefix"],
+                        organization=e["organization"],
+                        isp=e["isp"],
+                        country=e["country"],
+                        reverse_dns=e["reverse_dns"],
+                        source=e["source"],
                     )
                 c = class_map.get(rec.ip)
                 if c:
                     rec.classification = Classification(
-                        provider=c["provider"], cdn=c["cdn"], confidence=c["confidence"],
+                        provider=c["provider"],
+                        cdn=c["cdn"],
+                        confidence=c["confidence"],
                         evidence=json.loads(c["evidence_json"] or "[]"),
                     )
                 v = val_map.get(key)
                 if v:
                     data = json.loads(v["result_json"] or "{}")
                     fields = ValidationResult.__dataclass_fields__
-                    rec.validation = ValidationResult(**{k: data.get(k) for k in fields if k in data})
+                    rec.validation = ValidationResult(
+                        **{k: data.get(k) for k in fields if k in data}
+                    )
 
     def close(self) -> None:
         with self._lock:
@@ -151,6 +194,7 @@ class EvidenceStore:
         related_hostname: str | None = None,
         timestamp: str | None = None,
     ) -> tuple[IpRecord, bool]:
+        """Insert or merge IP. Returns (record, is_new_ip)."""
         ts = timestamp or utc_now_iso()
         key = (hostname, ip)
         with self._lock:
@@ -164,6 +208,7 @@ class EvidenceStore:
             if status:
                 rec.add_status(status)
             if source:
+                # provenance dedup: same type+resolver+tool+detail within same second ok to skip exact dupes
                 sig = (source.type, source.resolver, source.tool, json.dumps(source.detail, sort_keys=True))
                 existing_sigs = {
                     (s.type, s.resolver, s.tool, json.dumps(s.detail, sort_keys=True))
@@ -173,21 +218,39 @@ class EvidenceStore:
                     rec.sources.append(source)
                     self._conn.execute(
                         "INSERT OR IGNORE INTO sources (hostname, ip, type, timestamp, resolver, tool, detail_json) VALUES (?,?,?,?,?,?,?)",
-                        (hostname, ip, source.type, source.timestamp, source.resolver, source.tool, json.dumps(source.detail, sort_keys=True)),
+                        (
+                            hostname,
+                            ip,
+                            source.type,
+                            source.timestamp,
+                            source.resolver,
+                            source.tool,
+                            json.dumps(source.detail, sort_keys=True),
+                        ),
                     )
             if dns_update:
                 rec.dns.update(dns_update)
             if related_hostname and related_hostname not in rec.related_hostnames:
                 rec.related_hostnames.append(related_hostname)
             self._conn.execute(
-                """INSERT INTO ip_records (hostname, ip, first_seen, last_seen, statuses_json, dns_json, related_hostnames_json)
-                   VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(hostname, ip) DO UPDATE SET
-                   last_seen=excluded.last_seen,
-                   statuses_json=excluded.statuses_json,
-                   dns_json=excluded.dns_json,
-                   related_hostnames_json=excluded.related_hostnames_json""",
-                (hostname, ip, rec.first_seen, rec.last_seen, json.dumps(rec.statuses), json.dumps(rec.dns), json.dumps(rec.related_hostnames)),
+                """
+                INSERT INTO ip_records (hostname, ip, first_seen, last_seen, statuses_json, dns_json, related_hostnames_json)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(hostname, ip) DO UPDATE SET
+                    last_seen=excluded.last_seen,
+                    statuses_json=excluded.statuses_json,
+                    dns_json=excluded.dns_json,
+                    related_hostnames_json=excluded.related_hostnames_json
+                """,
+                (
+                    hostname,
+                    ip,
+                    rec.first_seen,
+                    rec.last_seen,
+                    json.dumps(rec.statuses),
+                    json.dumps(rec.dns),
+                    json.dumps(rec.related_hostnames),
+                ),
             )
             self._conn.commit()
             self._write_txt(hostname)
@@ -196,53 +259,84 @@ class EvidenceStore:
     def save_observation(self, obs: dict[str, Any]) -> None:
         with self._lock:
             self._conn.execute(
-                """INSERT INTO observations (hostname, record_type, value, resolver, timestamp, source, cname_chain_json, tool, ip)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (obs.get("hostname"), obs.get("record_type"), obs.get("value"), obs.get("resolver"),
-                 obs.get("timestamp"), obs.get("source"), json.dumps(obs.get("cname_chain") or []),
-                 obs.get("tool"), obs.get("ip")),
+                """
+                INSERT INTO observations (hostname, record_type, value, resolver, timestamp, source, cname_chain_json, tool, ip)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    obs.get("hostname"),
+                    obs.get("record_type"),
+                    obs.get("value"),
+                    obs.get("resolver"),
+                    obs.get("timestamp"),
+                    obs.get("source"),
+                    json.dumps(obs.get("cname_chain") or []),
+                    obs.get("tool"),
+                    obs.get("ip"),
+                ),
             )
             self._conn.commit()
 
     def save_enrichment(self, ip: str, network: NetworkInfo) -> None:
         with self._lock:
             self._conn.execute(
-                """INSERT INTO enrichment (ip, asn, prefix, organization, isp, country, reverse_dns, source, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(ip) DO UPDATE SET
-                   asn=excluded.asn, prefix=excluded.prefix, organization=excluded.organization,
-                   isp=excluded.isp, country=excluded.country, reverse_dns=excluded.reverse_dns,
-                   source=excluded.source, updated_at=excluded.updated_at""",
-                (ip, network.asn, network.prefix, network.organization, network.isp, network.country,
-                 network.reverse_dns, network.source, utc_now_iso()),
+                """
+                INSERT INTO enrichment (ip, asn, prefix, organization, isp, country, reverse_dns, source, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(ip) DO UPDATE SET
+                    asn=excluded.asn, prefix=excluded.prefix, organization=excluded.organization,
+                    isp=excluded.isp, country=excluded.country, reverse_dns=excluded.reverse_dns,
+                    source=excluded.source, updated_at=excluded.updated_at
+                """,
+                (
+                    ip,
+                    network.asn,
+                    network.prefix,
+                    network.organization,
+                    network.isp,
+                    network.country,
+                    network.reverse_dns,
+                    network.source,
+                    utc_now_iso(),
+                ),
             )
             self._conn.commit()
-            for (_, i), rec in self._records.items():
+            for (h, i), rec in self._records.items():
                 if i == ip:
                     rec.network = network
 
     def save_classification(self, ip: str, classification: Classification) -> None:
         with self._lock:
             self._conn.execute(
-                """INSERT INTO classification (ip, provider, cdn, confidence, evidence_json, updated_at)
-                   VALUES (?,?,?,?,?,?)
-                   ON CONFLICT(ip) DO UPDATE SET
-                   provider=excluded.provider, cdn=excluded.cdn, confidence=excluded.confidence,
-                   evidence_json=excluded.evidence_json, updated_at=excluded.updated_at""",
-                (ip, classification.provider, classification.cdn, classification.confidence,
-                 json.dumps(classification.evidence), utc_now_iso()),
+                """
+                INSERT INTO classification (ip, provider, cdn, confidence, evidence_json, updated_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(ip) DO UPDATE SET
+                    provider=excluded.provider, cdn=excluded.cdn, confidence=excluded.confidence,
+                    evidence_json=excluded.evidence_json, updated_at=excluded.updated_at
+                """,
+                (
+                    ip,
+                    classification.provider,
+                    classification.cdn,
+                    classification.confidence,
+                    json.dumps(classification.evidence),
+                    utc_now_iso(),
+                ),
             )
             self._conn.commit()
-            for (_, i), rec in self._records.items():
+            for (h, i), rec in self._records.items():
                 if i == ip:
                     rec.classification = classification
 
     def save_validation(self, hostname: str, ip: str, result: ValidationResult) -> None:
         with self._lock:
             self._conn.execute(
-                """INSERT INTO validation (hostname, ip, result_json, timestamp)
-                   VALUES (?,?,?,?)
-                   ON CONFLICT(hostname, ip) DO UPDATE SET result_json=excluded.result_json, timestamp=excluded.timestamp""",
+                """
+                INSERT INTO validation (hostname, ip, result_json, timestamp)
+                VALUES (?,?,?,?)
+                ON CONFLICT(hostname, ip) DO UPDATE SET result_json=excluded.result_json, timestamp=excluded.timestamp
+                """,
                 (hostname, ip, json.dumps(result.to_dict()), result.timestamp or utc_now_iso()),
             )
             self._conn.commit()
@@ -261,8 +355,14 @@ class EvidenceStore:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO failures (source, operation, hostname, timestamp, error_type, message) VALUES (?,?,?,?,?,?)",
-                (failure.get("source"), failure.get("operation"), failure.get("hostname"),
-                 failure.get("timestamp"), failure.get("error_type"), failure.get("message")),
+                (
+                    failure.get("source"),
+                    failure.get("operation"),
+                    failure.get("hostname"),
+                    failure.get("timestamp"),
+                    failure.get("error_type"),
+                    failure.get("message"),
+                ),
             )
             self._conn.commit()
 
@@ -287,6 +387,7 @@ class EvidenceStore:
         return path
 
     def import_txt_ips(self, hostname: str, path: Path, status: str = "UNVERIFIED") -> int:
+        """Load legacy unique-IP text file without inventing provenance."""
         if not path.is_file():
             return 0
         n = 0

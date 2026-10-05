@@ -13,6 +13,8 @@ from typing import Iterable
 from ..models import Classification, NetworkInfo
 
 
+# Patterns matched against *observed* strings only (CNAME, PTR, org, ASN text).
+# Matching a pattern is evidence; absence means UNKNOWN — not a guess list of IPs.
 _EVIDENCE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("Akamai", re.compile(r"akamai|edgekey\.net|akamaiedge\.net|akamaitechnologies", re.I)),
     ("Cloudflare", re.compile(r"cloudflare|\.cdn\.cloudflare\.net", re.I)),
@@ -63,6 +65,7 @@ def classify_from_evidence(
             evidence=["No CDN/provider evidence found in available fields; provider=UNKNOWN"],
         )
 
+    # Pick provider with most distinct evidence hits
     provider = sorted(hits.items(), key=lambda x: (-x[1], x[0]))[0][0]
     score = hits[provider]
     if score >= 3:
@@ -74,7 +77,7 @@ def classify_from_evidence(
 
     return Classification(
         provider=provider,
-        cdn=provider,
+        cdn=provider,  # only set when evidence supports CDN-class provider above
         confidence=confidence,
         evidence=evidence,
     )

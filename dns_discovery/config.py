@@ -21,7 +21,7 @@ DEFAULT_RESOLVERS = [
     "208.67.222.222",
 ]
 
-# Optional network-specific exclusions. Keep empty in the public build; callers can supply their own values.
+# Optional environment-specific DNS poison/captive answers. Keep empty in the public build; provide values with --excluded-ips when needed.
 DEFAULT_EXCLUDED_IPS = frozenset()
 
 

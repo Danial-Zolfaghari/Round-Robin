@@ -71,6 +71,7 @@ class LiveDnsSource:
 
             cname_chain: list[str] = []
             try:
+                # Resolve A and capture CNAME chain from response
                 try:
                     answer = await resolver.resolve(hostname, "A")
                     chain = _extract_cname_chain(answer)
@@ -79,9 +80,32 @@ class LiveDnsSource:
                         ip = rr.to_text()
                         if ip in self.excluded_ips or not is_ipv4(ip):
                             continue
-                        observations.append(DnsObservation(hostname=hostname, record_type="A", value=ip, ip=ip, resolver=resolver_ip, timestamp=ts, source="live_dns", cname_chain=list(cname_chain), tool="dnspython"))
+                        observations.append(
+                            DnsObservation(
+                                hostname=hostname,
+                                record_type="A",
+                                value=ip,
+                                ip=ip,
+                                resolver=resolver_ip,
+                                timestamp=ts,
+                                source="live_dns",
+                                cname_chain=list(cname_chain),
+                                tool="dnspython",
+                            )
+                        )
                     if cname_chain:
-                        observations.append(DnsObservation(hostname=hostname, record_type="CNAME", value=cname_chain[-1] if cname_chain else "", resolver=resolver_ip, timestamp=ts, source="live_dns", cname_chain=list(cname_chain), tool="dnspython"))
+                        observations.append(
+                            DnsObservation(
+                                hostname=hostname,
+                                record_type="CNAME",
+                                value=cname_chain[-1] if cname_chain else "",
+                                resolver=resolver_ip,
+                                timestamp=ts,
+                                source="live_dns",
+                                cname_chain=list(cname_chain),
+                                tool="dnspython",
+                            )
+                        )
                 except dns.resolver.NXDOMAIN as e:
                     self.failures.record("live_dns", "A", e, hostname=hostname, error_type="NXDOMAIN")
                 except dns.resolver.NoAnswer:
@@ -96,15 +120,29 @@ class LiveDnsSource:
                         answer6 = await resolver.resolve(hostname, "AAAA")
                         for rr in answer6:
                             ip = rr.to_text()
-                            observations.append(DnsObservation(hostname=hostname, record_type="AAAA", value=ip, ip=ip, resolver=resolver_ip, timestamp=ts, source="live_dns", cname_chain=list(cname_chain), tool="dnspython"))
+                            observations.append(
+                                DnsObservation(
+                                    hostname=hostname,
+                                    record_type="AAAA",
+                                    value=ip,
+                                    ip=ip,
+                                    resolver=resolver_ip,
+                                    timestamp=ts,
+                                    source="live_dns",
+                                    cname_chain=list(cname_chain),
+                                    tool="dnspython",
+                                )
+                            )
                     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
                         pass
                     except dns.exception.Timeout as e:
                         self.failures.record("live_dns", "AAAA", e, hostname=hostname, error_type="Timeout")
                     except Exception as e:
                         self.failures.record("live_dns", "AAAA", e, hostname=hostname)
+
             except Exception as e:
                 self.failures.record("live_dns", "resolve", e, hostname=hostname)
+
             return observations
 
 
@@ -128,13 +166,25 @@ def _extract_cname_chain(answer: Any) -> list[str]:
     return chain
 
 
+# Import dns.resolver for exception types used above
 import dns.resolver  # noqa: E402
 
 
 class LegacyToolDnsSource:
+    """Optional subprocess-based tools with protocol-aware parsers and bounded concurrency."""
+
     TOOLS = ("dig", "host", "nslookup", "drill")
 
-    def __init__(self, resolvers: list[str], tools: list[str], rate_limiter: RateLimiter, failures: FailureSink, timeout: float = 6.0, semaphore: asyncio.Semaphore | None = None, excluded_ips: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        resolvers: list[str],
+        tools: list[str],
+        rate_limiter: RateLimiter,
+        failures: FailureSink,
+        timeout: float = 6.0,
+        semaphore: asyncio.Semaphore | None = None,
+        excluded_ips: set[str] | None = None,
+    ) -> None:
         self.resolvers = resolvers
         self.tools = [t for t in tools if t in self.TOOLS and shutil.which(t)]
         self.rate = rate_limiter
@@ -149,7 +199,11 @@ class LegacyToolDnsSource:
     async def query_hostname(self, hostname: str) -> list[DnsObservation]:
         if not self.tools:
             return []
-        tasks = [self.run_one(hostname, tool, resolver) for tool in self.tools for resolver in self.resolvers]
+        tasks = [
+            self.run_one(hostname, tool, resolver)
+            for tool in self.tools
+            for resolver in self.resolvers
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[DnsObservation] = []
         for item in results:
@@ -165,34 +219,84 @@ class LegacyToolDnsSource:
     async def _run(self, hostname: str, tool: str, resolver: str) -> list[DnsObservation]:
         async with self.sem:
             await self.rate.acquire(resolver=resolver, hostname=hostname, source="legacy_dns")
-            if tool == "dig": cmd, short = ["dig", f"@{resolver}", "+short", "A", hostname], True
-            elif tool == "host": cmd, short = ["host", hostname, resolver], False
-            elif tool == "nslookup": cmd, short = ["nslookup", hostname, resolver], False
-            elif tool == "drill": cmd, short = ["drill", f"@{resolver}", "A", hostname], False
-            else: return []
+            if tool == "dig":
+                cmd = ["dig", f"@{resolver}", "+short", "A", hostname]
+                short = True
+            elif tool == "host":
+                cmd = ["host", hostname, resolver]
+                short = False
+            elif tool == "nslookup":
+                cmd = ["nslookup", hostname, resolver]
+                short = False
+            elif tool == "drill":
+                cmd = ["drill", f"@{resolver}", "A", hostname]
+                short = False
+            else:
+                return []
+
             try:
-                proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
             except FileNotFoundError as e:
                 self.failures.record("legacy_dns", tool, e, hostname=hostname, error_type="ToolMissing")
                 return []
+
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout)
             except asyncio.TimeoutError as e:
                 try:
-                    proc.kill(); await proc.wait()
-                except Exception: pass
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
                 self.failures.record("legacy_dns", tool, e, hostname=hostname, error_type="Timeout")
                 return []
+
             output = stdout.decode(errors="ignore")
             if proc.returncode not in (0, None) and not output.strip():
                 err = stderr.decode(errors="ignore")[:500]
-                self.failures.record("legacy_dns", tool, err or f"exit {proc.returncode}", hostname=hostname, error_type="ResolverFailure")
+                self.failures.record(
+                    "legacy_dns",
+                    tool,
+                    err or f"exit {proc.returncode}",
+                    hostname=hostname,
+                    error_type="ResolverFailure",
+                )
                 return []
+
             parsed = parse_tool_output(tool, output, query_name=hostname, short=short)
-            ts = utc_now_iso(); observations=[]
+            ts = utc_now_iso()
+            observations: list[DnsObservation] = []
             for ip in parsed.ipv4:
-                if ip == resolver or ip in self.excluded_ips: continue
-                observations.append(DnsObservation(hostname=hostname, record_type="A", value=ip, ip=ip, resolver=resolver, timestamp=ts, source="live_dns", cname_chain=list(parsed.cnames), tool=tool))
+                if ip == resolver or ip in self.excluded_ips:
+                    continue
+                observations.append(
+                    DnsObservation(
+                        hostname=hostname,
+                        record_type="A",
+                        value=ip,
+                        ip=ip,
+                        resolver=resolver,
+                        timestamp=ts,
+                        source="live_dns",
+                        cname_chain=list(parsed.cnames),
+                        tool=tool,
+                    )
+                )
             for cname in parsed.cnames:
-                observations.append(DnsObservation(hostname=hostname, record_type="CNAME", value=cname, resolver=resolver, timestamp=ts, source="live_dns", cname_chain=list(parsed.cnames), tool=tool))
+                observations.append(
+                    DnsObservation(
+                        hostname=hostname,
+                        record_type="CNAME",
+                        value=cname,
+                        resolver=resolver,
+                        timestamp=ts,
+                        source="live_dns",
+                        cname_chain=list(parsed.cnames),
+                        tool=tool,
+                    )
+                )
             return observations

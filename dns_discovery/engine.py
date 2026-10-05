@@ -91,6 +91,7 @@ class DiscoveryEngine:
         )
 
     async def discover_once(self, hostname: str) -> dict[str, Any]:
+        """Single-pass multi-source discovery for one hostname."""
         summary: dict[str, Any] = {
             "hostname": hostname,
             "timestamp": utc_now_iso(),
@@ -99,10 +100,13 @@ class DiscoveryEngine:
             "ct": None,
             "new_ips": [],
         }
+
+        # --- Live DNS ---
         if "dns" in self.config.sources:
             summary["sources_run"].append("dns")
             await self._run_live_dns(hostname, summary)
 
+        # --- Certificate Transparency ---
         related_hosts: list[str] = []
         if "ct" in self.config.sources:
             summary["sources_run"].append("ct")
@@ -125,6 +129,7 @@ class DiscoveryEngine:
             }
             related_hosts = list(ct_result.get("hostnames") or [])
 
+        # --- Passive DNS ---
         if "passive" in self.config.sources or "passive_dns" in self.config.sources:
             summary["sources_run"].append("passive")
             agg = PassiveDnsAggregator(
@@ -142,10 +147,12 @@ class DiscoveryEngine:
                 host = rec.get("hostname") or hostname
                 if not ip or ip in self.config.excluded_ips:
                     continue
+                # Only attach to target hostname if the passive record matches it or parent scope
                 target = hostname if host == hostname or host.endswith("." + hostname.split(".", 1)[-1]) else hostname
+                is_exact = host == hostname
                 status = (
                     ObservationStatus.HISTORICALLY_OBSERVED.value
-                    if host == hostname
+                    if is_exact
                     else ObservationStatus.CANDIDATE.value
                 )
                 new = self._ingest_ip(
@@ -169,28 +176,34 @@ class DiscoveryEngine:
                 if new:
                     summary["new_ips"].append(ip)
 
+        # --- Resolve related CT hostnames (bounded) → candidate IPs ---
         if related_hosts and "dns" in self.config.sources:
+            # Prefer names that look related to the target (same parent) and the exact target
             parent = ".".join(hostname.split(".")[-2:])
             prioritized = [hostname] + [
                 h for h in related_hosts if h != hostname and (h == parent or h.endswith("." + parent))
             ]
+            # unique preserve
             seen: set[str] = set()
             ordered: list[str] = []
             for h in prioritized:
                 if h not in seen:
                     seen.add(h)
                     ordered.append(h)
+            to_resolve = ordered[: self.config.max_related_resolve]
             live = self._live_dns()
-            for rel in ordered[: self.config.max_related_resolve]:
+            for rel in to_resolve:
                 if self.stop_event.is_set():
                     break
                 if rel == hostname:
-                    continue
+                    continue  # already resolved
                 obs_list = await live.query_hostname(rel)
                 self.stats["dns_queries"] += len(self.config.resolvers)
                 for obs in obs_list:
                     self.store.save_observation(obs.to_dict())
                     if obs.ip and obs.record_type in ("A", "AAAA"):
+                        # Related hostname IP is CANDIDATE for the *target* only if same apex;
+                        # store under related hostname primarily
                         self._ingest_ip(
                             rel,
                             obs.ip,
@@ -202,8 +215,12 @@ class DiscoveryEngine:
                                 tool=obs.tool,
                                 detail={"via": "ct_related_hostname", "cname_chain": obs.cname_chain},
                             ),
-                            dns_update={"record_type": obs.record_type, "cname_chain": obs.cname_chain},
+                            dns_update={
+                                "record_type": obs.record_type,
+                                "cname_chain": obs.cname_chain,
+                            },
                         )
+                        # Also link as candidate under original target with provenance
                         self._ingest_ip(
                             hostname,
                             obs.ip,
@@ -223,8 +240,11 @@ class DiscoveryEngine:
                             dns_update={"cname_chain": obs.cname_chain},
                         )
 
+        # --- Enrich + classify ---
         if self.config.do_enrich:
             await self._enrich_hostname(hostname)
+
+        # --- Validate ---
         if self.config.do_validate:
             await self._validate_hostname(hostname)
 
@@ -233,6 +253,7 @@ class DiscoveryEngine:
         return summary
 
     async def hunt_round(self, hostnames: list[str]) -> list[str]:
+        """One continuous-hunt round: live DNS only (fast path), bounded concurrency."""
         live = self._live_dns()
         legacy = self._legacy_dns()
         new_ips: list[str] = []
@@ -258,7 +279,10 @@ class DiscoveryEngine:
                             tool=obs.tool,
                             detail={"cname_chain": obs.cname_chain},
                         ),
-                        dns_update={"record_type": obs.record_type, "cname_chain": obs.cname_chain},
+                        dns_update={
+                            "record_type": obs.record_type,
+                            "cname_chain": obs.cname_chain,
+                        },
                     )
                     if is_new:
                         new_ips.append(obs.ip)
@@ -290,7 +314,10 @@ class DiscoveryEngine:
                         tool=obs.tool,
                         detail={"cname_chain": obs.cname_chain, "record_type": obs.record_type},
                     ),
-                    dns_update={"record_type": obs.record_type, "cname_chain": obs.cname_chain},
+                    dns_update={
+                        "record_type": obs.record_type,
+                        "cname_chain": obs.cname_chain,
+                    },
                 )
                 if is_new:
                     summary["new_ips"].append(obs.ip)
@@ -338,8 +365,10 @@ class DiscoveryEngine:
             rps=self.config.rate.enrich_rps,
             semaphore=asyncio.Semaphore(self.config.concurrency.max_enrich),
         )
+        records = self.store.all_records(hostname)
+        # Deduplicate by IP for enrichment
         seen_ip: set[str] = set()
-        for rec in self.store.all_records(hostname):
+        for rec in records:
             if rec.ip in seen_ip:
                 continue
             seen_ip.add(rec.ip)
@@ -348,7 +377,8 @@ class DiscoveryEngine:
             network = await enricher.enrich(rec.ip)
             self.store.save_enrichment(rec.ip, network)
             cname = (rec.dns or {}).get("cname_chain") or []
-            self.store.save_classification(rec.ip, classify_from_evidence(network=network, cname_chain=cname))
+            classification = classify_from_evidence(network=network, cname_chain=cname)
+            self.store.save_classification(rec.ip, classification)
 
     async def _validate_hostname(self, hostname: str) -> None:
         validator = ActiveValidator(
@@ -361,7 +391,7 @@ class DiscoveryEngine:
             rps=self.config.rate.validate_rps,
         )
         records = self.store.all_records(hostname)
-
+        # Validate CURRENTLY_OBSERVED first, then others
         def sort_key(r: Any) -> int:
             if ObservationStatus.CURRENTLY_OBSERVED.value in r.statuses:
                 return 0

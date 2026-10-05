@@ -10,7 +10,7 @@ import dns.exception
 import httpx
 
 from ..failures import FailureSink
-from ..models import NetworkInfo
+from ..models import NetworkInfo, utc_now_iso
 from ..rate_limit import RateLimiter
 
 
@@ -36,6 +36,7 @@ class Enricher:
     async def enrich(self, ip: str) -> NetworkInfo:
         async with self.sem:
             await self.rate.acquire(named="enrich", source="enrichment")
+            # Prefer combining multiple real sources; never invent fields.
             ip_api_data = await self._ip_api(ip)
             rdap_data = await self._rdap(ip)
             rdns = await self._reverse_dns(ip)
@@ -50,6 +51,7 @@ class Enricher:
 
             if ip_api_data:
                 sources.append("ip-api.com")
+                # as field like "AS20940 Akamai International B.V."
                 as_field = ip_api_data.get("as") or ""
                 if as_field.startswith("AS"):
                     asn = as_field.split(" ", 1)[0]
@@ -57,7 +59,7 @@ class Enricher:
                         organization = as_field.split(" ", 1)[1] or None
                 if ip_api_data.get("org"):
                     organization = ip_api_data.get("org")
-                isp = ip_api_data.get("isp")
+                isp = ip_api_data.get("isp")  # keep separate from organization
                 country = ip_api_data.get("countryCode") or ip_api_data.get("country")
                 if not rdns and ip_api_data.get("reverse"):
                     rdns = ip_api_data.get("reverse")
@@ -68,6 +70,7 @@ class Enricher:
                 if not prefix and rdap_data.get("prefix"):
                     prefix = rdap_data["prefix"]
                 if not organization and rdap_data.get("name"):
+                    # RDAP name is often network handle name, not always org — store as network name evidence
                     organization = organization or rdap_data.get("org") or rdap_data.get("name")
                 if not asn and rdap_data.get("asn"):
                     asn = rdap_data["asn"]
@@ -76,11 +79,13 @@ class Enricher:
                 sources.append("team_cymru_dns")
                 asn = asn or cymru.get("asn")
                 prefix = prefix or cymru.get("prefix")
+                # Cymru ASN description is AS owner — map to organization only if empty
                 if not organization and cymru.get("as_org"):
                     organization = cymru["as_org"]
 
-            if rdns and "reverse_dns" not in " ".join(sources):
-                sources.append("ptr")
+            if rdns:
+                if "reverse_dns" not in " ".join(sources):
+                    sources.append("ptr")
 
             return NetworkInfo(
                 asn=asn,
@@ -94,12 +99,24 @@ class Enricher:
 
     async def _ip_api(self, ip: str) -> dict[str, Any] | None:
         url = f"http://ip-api.com/json/{ip}"
-        params = {"fields": "status,message,country,countryCode,as,asname,org,isp,query,reverse"}
+        params = {
+            "fields": "status,message,country,countryCode,as,asname,org,isp,query,reverse"
+        }
         try:
-            resp = await self.client.get(url, params=params, headers={"User-Agent": self.user_agent}, timeout=15.0)
+            resp = await self.client.get(
+                url,
+                params=params,
+                headers={"User-Agent": self.user_agent},
+                timeout=15.0,
+            )
             data = resp.json()
             if data.get("status") != "success":
-                self.failures.record("enrichment", "ip-api", data.get("message") or "unsuccessful", error_type="ApiFailure")
+                self.failures.record(
+                    "enrichment",
+                    "ip-api",
+                    data.get("message") or "unsuccessful",
+                    error_type="ApiFailure",
+                )
                 return None
             return data
         except Exception as e:
@@ -107,6 +124,7 @@ class Enricher:
             return None
 
     async def _rdap(self, ip: str) -> dict[str, Any] | None:
+        # Bootstrap via rdap.org redirector
         url = f"https://rdap.org/ip/{ip}"
         try:
             resp = await self.client.get(
@@ -136,6 +154,7 @@ class Enricher:
                 roles = ent.get("roles") or []
                 if "registrant" in roles or "abuse" in roles:
                     vcard = ent.get("vcardArray")
+                    # leave org extraction conservative
                     if isinstance(vcard, list) and len(vcard) > 1:
                         for item in vcard[1]:
                             if isinstance(item, list) and item and item[0] == "fn" and len(item) >= 4:
@@ -164,11 +183,13 @@ class Enricher:
             names = [str(r.target).rstrip(".").lower() for r in ans]
             return names[0] if names else None
         except Exception as e:
+            # No PTR is common — record as soft failure only for unexpected errors
             if "NXDOMAIN" not in type(e).__name__ and "NoAnswer" not in type(e).__name__:
                 self.failures.record("enrichment", "ptr", e)
             return None
 
     async def _cymru(self, ip: str) -> dict[str, Any] | None:
+        # IPv4 only for origin.asn.cymru.com
         if ":" in ip:
             return None
         rev = ".".join(reversed(ip.split("."))) + ".origin.asn.cymru.com"
@@ -177,6 +198,7 @@ class Enricher:
         resolver.lifetime = 6.0
         try:
             ans = await resolver.resolve(rev, "TXT")
+            # "20940 | 23.32.0.0/11 | US | ripencc | 2010-11-22"
             text = ans[0].to_text().strip('"')
             parts = [p.strip() for p in text.split("|")]
             out: dict[str, Any] = {"raw": text}
@@ -186,10 +208,12 @@ class Enricher:
                 out["prefix"] = parts[1]
             if len(parts) > 2:
                 out["country"] = parts[2]
+            # ASN description
             try:
                 asn_num = parts[0].lstrip("AS")
                 desc_ans = await resolver.resolve(f"AS{asn_num}.asn.cymru.com", "TXT")
                 desc = desc_ans[0].to_text().strip('"')
+                # "20940 | US | ripencc | 2001-01-01 | AKAMAI-ASN1, US"
                 dparts = [p.strip() for p in desc.split("|")]
                 if len(dparts) >= 5:
                     out["as_org"] = dparts[4]

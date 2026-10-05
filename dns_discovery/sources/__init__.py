@@ -1,1 +1,1 @@
-"""Passive source adapters."""
+"""Source adapters package."""

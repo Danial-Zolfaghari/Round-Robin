@@ -93,60 +93,101 @@ def parse_dig_full(output: str) -> ParsedDns:
 
 
 def parse_nslookup(output: str, query_name: str | None = None) -> ParsedDns:
+    """
+    Parse nslookup — prefer Addresses under the answered name.
+    Skip the initial 'Server:' / 'Address:' resolver lines.
+    """
     result = ParsedDns(section="answer")
-    seen_answer = False
-    for raw in output.splitlines():
-        line = raw.strip()
-        low = line.lower()
-        if not line:
-            continue
+    lines = output.splitlines()
+    # Drop resolver preamble: first Server/Address block
+    i = 0
+    while i < len(lines):
+        if lines[i].strip().lower().startswith("server:"):
+            i += 1
+            if i < len(lines) and "address" in lines[i].lower():
+                i += 1
+            # blank line often follows
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            break
+        i += 1
+
+    body = "\n".join(lines[i:])
+    # Non-authoritative / Name: ... Address(es):
+    current_name = None
+    collecting_addrs = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        low = stripped.lower()
         if low.startswith("name:"):
-            seen_answer = True
+            current_name = stripped.split(":", 1)[1].strip().rstrip(".").lower()
+            collecting_addrs = False
             continue
-        if query_name and query_name.lower() in low:
-            seen_answer = True
-        if low.startswith("server:") and not seen_answer:
+        if "canonical name" in low or low.startswith("cname"):
+            # Aliases / canonical name = foo
+            if "=" in stripped:
+                cname = stripped.split("=", 1)[1].strip().rstrip(".").lower()
+                result.cnames.append(cname)
+            collecting_addrs = False
             continue
-        if low.startswith("address:") and not seen_answer:
+        if low.startswith("address") or low.startswith("addresses"):
+            collecting_addrs = True
+            # Address: 1.2.3.4  or Addresses: 1.2.3.4
+            after = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+            for m in IPV4_RE.findall(after):
+                if _valid_ipv4(m):
+                    result.ipv4.append(m)
+            for m in IPV6_RE.findall(after):
+                if _valid_ipv6(m):
+                    result.ipv6.append(m)
             continue
-        if "canonical name" in low or "aliases:" in low:
-            candidate = line.split("=", 1)[-1].split(":", 1)[-1].strip().rstrip(".")
-            if candidate and candidate != line:
-                result.cnames.append(candidate.lower())
-            continue
-        if seen_answer or low.startswith("addresses:") or low.startswith("address:"):
-            for ip in IPV4_RE.findall(line):
-                if _valid_ipv4(ip): result.ipv4.append(ip)
-            for ip in IPV6_RE.findall(line):
-                if _valid_ipv6(ip): result.ipv6.append(ip)
+        if collecting_addrs and stripped:
+            for m in IPV4_RE.findall(stripped):
+                if _valid_ipv4(m):
+                    result.ipv4.append(m)
+            for m in IPV6_RE.findall(stripped):
+                if _valid_ipv6(m):
+                    result.ipv6.append(m)
+            if not IPV4_RE.search(stripped) and not IPV6_RE.search(stripped):
+                collecting_addrs = False
+
+    # Fallback: if nothing found, do not scrape whole stdout (avoids resolver IP FP)
+    _ = current_name, query_name
     return result
 
 
 def parse_host(output: str) -> ParsedDns:
-    result = ParsedDns(section="answer")
+    """Parse `host` output lines."""
+    result = ParsedDns(section="host")
     for line in output.splitlines():
-        line = line.strip()
         low = line.lower()
         if " has address " in low:
-            val = line.rsplit(" ", 1)[-1]
-            if _valid_ipv4(val): result.ipv4.append(val)
-        elif " has ipv6 address " in low:
-            val = line.rsplit(" ", 1)[-1]
-            if _valid_ipv6(val): result.ipv6.append(val)
+            ip = line.split("has address", 1)[1].strip()
+            if _valid_ipv4(ip):
+                result.ipv4.append(ip)
+        elif " has IPv6 address " in line or " has ipv6 address " in low:
+            ip = line.split("address", 1)[1].strip()
+            if _valid_ipv6(ip):
+                result.ipv6.append(ip)
         elif " is an alias for " in low:
-            val = line.rsplit(" ", 1)[-1].rstrip(".")
-            if val: result.cnames.append(val.lower())
+            cname = line.split("is an alias for", 1)[1].strip().rstrip(".").lower()
+            result.cnames.append(cname)
     return result
 
 
 def parse_drill(output: str) -> ParsedDns:
+    """Parse drill output — ANSWER SECTION similar to dig."""
     return parse_dig_full(output)
 
 
 def parse_tool_output(tool: str, output: str, query_name: str | None = None, short: bool = False) -> ParsedDns:
     tool = tool.lower()
-    if tool == "dig": return parse_dig_short(output) if short else parse_dig_full(output)
-    if tool == "nslookup": return parse_nslookup(output, query_name=query_name)
-    if tool == "host": return parse_host(output)
-    if tool == "drill": return parse_drill(output)
+    if tool == "dig":
+        return parse_dig_short(output) if short else parse_dig_full(output)
+    if tool == "nslookup":
+        return parse_nslookup(output, query_name=query_name)
+    if tool == "host":
+        return parse_host(output)
+    if tool == "drill":
+        return parse_drill(output)
     return ParsedDns()
