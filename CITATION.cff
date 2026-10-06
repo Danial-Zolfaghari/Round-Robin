@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this project, please cite the repository."
+title: "Round-Robin"
+authors:
+  - family-names: "Zolfaghari"
+    given-names: "Danial"
+    alias: "Danial-Zolfaghari"
+repository-code: "https://github.com/Danial-Zolfaghari/Round-Robin"
+url: "https://github.com/Danial-Zolfaghari/Round-Robin"
