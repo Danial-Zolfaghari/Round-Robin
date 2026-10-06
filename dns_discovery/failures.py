@@ -8,16 +8,17 @@ from typing import Callable
 
 from .models import FailureRecord, utc_now_iso
 
-_SECRET_PATTERNS = [
-    re.compile(r"(api[_-]?key|token|authorization|password|secret)\s*[:=]\s*\S+", re.I),
-    re.compile(r"Bearer\s+\S+", re.I),
-]
+_KEY_VALUE_SECRET = re.compile(
+    r"\b(api[_-]?key|token|authorization|password|secret)\b\s*[:=]\s*(?:Bearer\s+)?\S+",
+    re.I,
+)
+_BEARER_SECRET = re.compile(r"\bBearer\s+\S+", re.I)
 
 
 def redact(message: str) -> str:
-    out = message
-    for pat in _SECRET_PATTERNS:
-        out = pat.sub(lambda m: m.group(0).split("=")[0].split(":")[0] + "=[REDACTED]", out)
+    """Remove common credential forms from diagnostic text before it is stored."""
+    out = _KEY_VALUE_SECRET.sub(lambda m: f"{m.group(1)}=[REDACTED]", message)
+    out = _BEARER_SECRET.sub("Bearer [REDACTED]", out)
     return out[:2000]
 
 
