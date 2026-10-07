@@ -12,6 +12,12 @@
   <img alt="macOS" src="https://img.shields.io/badge/macOS-supported-000000?logo=apple&logoColor=white">
   <img alt="CI" src="https://github.com/Danial-Zolfaghari/Round-Robin/actions/workflows/ci.yml/badge.svg">
 </p>
+<p align="center">
+  <a href="https://github.com/Danial-Zolfaghari/Round-Robin/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Danial-Zolfaghari/Round-Robin/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/Danial-Zolfaghari/Round-Robin/releases"><img alt="Release" src="https://img.shields.io/github/v/release/Danial-Zolfaghari/Round-Robin?display_name=tag&sort=semver"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Danial-Zolfaghari/Round-Robin"></a>
+</p>
+
 
 ---
 
