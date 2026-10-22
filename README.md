@@ -21,6 +21,8 @@
 
 ---
 
+> **Portfolio case study:** [Round-Robin — engineering overview](https://danial-zolfaghari.github.io/work/round-robin/) · Danial Zolfaghari / دانیال ذوالفقاری
+
 ## Overview
 
 **Round-Robin** is a Python DNS-discovery pipeline built to collect candidate hostnames from multiple sources, validate them, resolve network information, enrich public IPs and persist results for later review.
